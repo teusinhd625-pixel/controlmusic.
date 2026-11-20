@@ -39,16 +39,26 @@ jobs:
             exit 1
           fi
           echo "Usando icone: $ICON"
-          CONVERT=$(command -v magick || command -v convert)
-          RES=android/app/src/main/res
-          rm -rf $RES/mipmap-anydpi-v26
-          for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-            name=${d%%:*}; size=${d##*:}
-            mkdir -p $RES/mipmap-$name
-            $CONVERT "$ICON" -resize ${size}x${size} $RES/mipmap-$name/ic_launcher.png
-            $CONVERT "$ICON" -resize ${size}x${size} $RES/mipmap-$name/ic_launcher_round.png
-            $CONVERT "$ICON" -resize ${size}x${size} $RES/mipmap-$name/ic_launcher_foreground.png
-          done
+          pip install pillow
+          ICON_PATH="$ICON" python3 - <<'EOF'
+          import os
+          from PIL import Image
+
+          icon = Image.open(os.environ["ICON_PATH"]).convert("RGBA")
+          res = "android/app/src/main/res"
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          import shutil
+          shutil.rmtree(res + "/mipmap-anydpi-v26", ignore_errors=True)
+
+          for name, size in sizes.items():
+              folder = f"{res}/mipmap-{name}"
+              os.makedirs(folder, exist_ok=True)
+              img = icon.resize((size, size), Image.LANCZOS)
+              for fn in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                  img.save(f"{folder}/{fn}")
+          print("Icones gerados com sucesso")
+          EOF
 
       - name: Compilar APK
         run: |
