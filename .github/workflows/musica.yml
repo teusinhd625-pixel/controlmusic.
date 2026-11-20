@@ -1,0 +1,268 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Criar projeto Capacitor
+        run: |
+          mkdir -p www
+          cp ./*.html www/index.html
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          npx cap init "Control Music" com.teusinhd625.controlmusic --web-dir=www
+          npx cap add android
+          npx cap sync android
+
+      - name: Aplicar icone do app
+        run: |
+          ICON=$(ls ./*.png 2>/dev/null | head -n 1)
+          if [ -z "$ICON" ]; then
+            echo "Nenhum arquivo .png encontrado na raiz do repositorio"
+            ls -la
+            exit 1
+          fi
+          echo "Usando icone: $ICON"
+          pip install pillow
+          ICON_PATH="$ICON" python3 - <<'EOF'
+          import os, shutil
+          from PIL import Image
+
+          icon = Image.open(os.environ["ICON_PATH"]).convert("RGBA")
+          res = "android/app/src/main/res"
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          shutil.rmtree(res + "/mipmap-anydpi-v26", ignore_errors=True)
+
+          for name, size in sizes.items():
+              folder = f"{res}/mipmap-{name}"
+              os.makedirs(folder, exist_ok=True)
+              img = icon.resize((size, size), Image.LANCZOS)
+              for fn in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                  img.save(f"{folder}/{fn}")
+          print("Icones gerados com sucesso")
+          EOF
+
+      - name: Controle de musica na notificacao
+        run: |
+          JDIR=android/app/src/main/java/com/teusinhd625/controlmusic
+          mkdir -p $JDIR
+
+          cat > $JDIR/MainActivity.java <<'JAVA'
+          package com.teusinhd625.controlmusic;
+
+          import android.Manifest;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              if (Build.VERSION.SDK_INT >= 33) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+              }
+            }
+
+            private void keepWeb() {
+              try {
+                WebView w = getBridge().getWebView();
+                MusicService.web = w;
+                w.onResume();
+                w.resumeTimers();
+              } catch (Exception e) {}
+            }
+
+            @Override
+            public void onResume() {
+              super.onResume();
+              keepWeb();
+              try { stopService(new Intent(this, MusicService.class)); } catch (Exception e) {}
+            }
+
+            @Override
+            public void onPause() {
+              super.onPause();
+              keepWeb();
+              try {
+                Intent i = new Intent(this, MusicService.class);
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                else startService(i);
+              } catch (Exception e) {}
+            }
+
+            @Override
+            public void onStop() {
+              super.onStop();
+              keepWeb();
+            }
+          }
+          JAVA
+
+          cat > $JDIR/MusicService.java <<'JAVA'
+          package com.teusinhd625.controlmusic;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.webkit.WebView;
+          import androidx.core.app.NotificationCompat;
+
+          public class MusicService extends Service {
+            public static WebView web;
+            private static final String CH = "ctl_music";
+            private static final int ID = 7;
+            private static final String JS_TOGGLE = "try{if(!media.paused){window.userPause=true}toggle()}catch(e){}";
+            private static final String JS_NEXT = "try{step(1,true)}catch(e){}";
+            private static final String JS_PREV = "try{step(-1,true)}catch(e){}";
+
+            private final Handler h = new Handler(Looper.getMainLooper());
+            private int taps = 0;
+
+            private final Runnable fire = new Runnable() {
+              public void run() {
+                int n = taps;
+                taps = 0;
+                if (n == 1) js(JS_TOGGLE);
+                else if (n == 2) js(JS_NEXT);
+                else if (n >= 3) js(JS_PREV);
+              }
+            };
+
+            private void js(final String code) {
+              final WebView w = web;
+              if (w == null) return;
+              w.post(new Runnable() {
+                public void run() { w.evaluateJavascript(code, null); }
+              });
+            }
+
+            private PendingIntent pi(String action, int code) {
+              Intent i = new Intent(this, MusicService.class);
+              i.setAction(action);
+              return PendingIntent.getService(this, code, i,
+                  PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            }
+
+            private Notification build() {
+              NotificationManager nm = getSystemService(NotificationManager.class);
+              if (Build.VERSION.SDK_INT >= 26) {
+                NotificationChannel c = new NotificationChannel(CH, "Controle de música",
+                    NotificationManager.IMPORTANCE_LOW);
+                nm.createNotificationChannel(c);
+              }
+              return new NotificationCompat.Builder(this, CH)
+                  .setSmallIcon(android.R.drawable.ic_media_play)
+                  .setContentTitle("Control Music")
+                  .setContentText("1 toque: pausa/toca  |  2: próxima  |  3: anterior")
+                  .setOngoing(true)
+                  .setOnlyAlertOnce(true)
+                  .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                  .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                  .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+                  .setContentIntent(pi("TAP", 0))
+                  .addAction(android.R.drawable.ic_media_previous, "Anterior", pi("PREV", 1))
+                  .addAction(android.R.drawable.ic_media_pause, "Play/Pause", pi("PP", 2))
+                  .addAction(android.R.drawable.ic_media_next, "Próxima", pi("NEXT", 3))
+                  .build();
+            }
+
+            private void goFg() {
+              Notification n = build();
+              if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+              } else {
+                startForeground(ID, n);
+              }
+            }
+
+            @Override
+            public void onCreate() {
+              super.onCreate();
+              goFg();
+            }
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              goFg();
+              String a = intent == null ? null : intent.getAction();
+              if ("TAP".equals(a)) {
+                taps++;
+                h.removeCallbacks(fire);
+                h.postDelayed(fire, 650);
+              } else if ("PP".equals(a)) {
+                js(JS_TOGGLE);
+              } else if ("NEXT".equals(a)) {
+                js(JS_NEXT);
+              } else if ("PREV".equals(a)) {
+                js(JS_PREV);
+              }
+              return START_NOT_STICKY;
+            }
+
+            @Override
+            public void onDestroy() {
+              h.removeCallbacksAndMessages(null);
+              stopForeground(true);
+              super.onDestroy();
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) { return null; }
+          }
+          JAVA
+
+          python3 - <<'EOF'
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          perms = (
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n'
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+              '    '
+          )
+          s = s.replace("<application", perms + "<application", 1)
+          svc = '<service android:name=".MusicService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    '
+          s = s.replace("</application>", svc + "</application>", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("Manifest atualizado")
+          EOF
+
+      - name: Compilar APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Control-Music-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
